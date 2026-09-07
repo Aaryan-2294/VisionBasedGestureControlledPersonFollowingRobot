@@ -12,3 +12,5 @@ log/
 
 *.swp
 .DS_Store
+
+vision/gesture_data/
