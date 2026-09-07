@@ -1,144 +1,190 @@
 import cv2
-import mediapipe as mp
 import csv
 import os
+import time
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
-BaseOptions = mp.tasks.BaseOptions
-HandLandmarker = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "gesture_data")
 
-options = HandLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path="hand_landmarker.task"),
-    running_mode=VisionRunningMode.VIDEO,
-    num_hands=1,
-    min_hand_detection_confidence=0.5,
-    min_hand_presence_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+RECORD_SECONDS = 10
+SAMPLE_INTERVAL = 0.05
 
-gestures = {
-    "1": "FOLLOW",
-    "2": "STOP",
-    "3": "DOCK"
-}
+os.makedirs(DATA_DIR, exist_ok=True)
 
-os.makedirs("gesture_data", exist_ok=True)
+gesture = input("Enter gesture (FOLLOW / STOP / DOCK): ").strip().upper()
 
-print("Select a gesture:")
-print("1 - FOLLOW")
-print("2 - STOP")
-print("3 - DOCK")
-
-choice = input("Enter choice: ")
-
-if choice not in gestures:
-    print("Invalid choice")
+if gesture not in ["FOLLOW", "STOP", "DOCK"]:
+    print("Invalid gesture.")
     exit()
-
-label = gestures[choice]
-filename = f"gesture_data/{label}.csv"
 
 cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
-    print("Error: Could not open camera")
+    print("Could not open camera.")
     exit()
 
-with HandLandmarker.create_from_options(options) as landmarker:
-    timestamp = 0
+base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
 
-    with open(filename, "a", newline="") as file:
-        writer = csv.writer(file)
+options = vision.HandLandmarkerOptions(
+    base_options=base_options,
+    running_mode=vision.RunningMode.VIDEO,
+    num_hands=1
+)
 
-        print(f"\nCollecting samples for: {label}")
-        print("Hold your gesture in front of the camera.")
-        print("Press Q to stop collecting.")
+landmarker = vision.HandLandmarker.create_from_options(options)
 
-        while True:
-            ret, frame = cap.read()
+data = []
+start_time = None
+last_sample_time = 0
+frame_timestamp = 0
 
-            if not ret:
-                break
+print(f"\nGet ready to record: {gesture}")
+print("Recording will start automatically.")
+print("Vary hand position, orientation and rotation.")
+print("Keep the same gesture shape while moving naturally.")
 
-            frame = cv2.flip(frame, 1)
+while True:
+    ret, frame = cap.read()
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if not ret:
+        break
 
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=rgb_frame
+    frame = cv2.flip(frame, 1)
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb
+    )
+
+    result = landmarker.detect_for_video(mp_image, frame_timestamp)
+    frame_timestamp += 1
+
+    if start_time is None:
+        start_time = time.time()
+
+    elapsed = time.time() - start_time
+    remaining = RECORD_SECONDS - elapsed
+
+    if elapsed >= RECORD_SECONDS:
+        break
+
+    if result.hand_landmarks:
+        hand = result.hand_landmarks[0]
+
+        connections = vision.HandLandmarksConnections.HAND_CONNECTIONS
+
+        for connection in connections:
+            start = hand[connection.start]
+            end = hand[connection.end]
+
+            start_point = (
+                int(start.x * frame.shape[1]),
+                int(start.y * frame.shape[0])
             )
 
-            timestamp += 1
-
-            results = landmarker.detect_for_video(
-                mp_image,
-                timestamp
+            end_point = (
+                int(end.x * frame.shape[1]),
+                int(end.y * frame.shape[0])
             )
 
-            if results.hand_landmarks:
-                landmarks = results.hand_landmarks[0]
+            cv2.line(
+                frame,
+                start_point,
+                end_point,
+                (0, 255, 0),
+                2
+            )
 
-                features = []
+        for landmark in hand:
+            point = (
+                int(landmark.x * frame.shape[1]),
+                int(landmark.y * frame.shape[0])
+            )
 
-                wrist_x = landmarks[0].x
-                wrist_y = landmarks[0].y
+            cv2.circle(
+                frame,
+                point,
+                4,
+                (0, 0, 255),
+                -1
+            )
 
-                for landmark in landmarks:
-                    features.append(landmark.x - wrist_x)
-                    features.append(landmark.y - wrist_y)
-                    features.append(landmark.z)
+        wrist = hand[0]
 
-                writer.writerow(features)
+        features = []
 
-                cv2.putText(
-                    frame,
-                    f"Collecting: {label}",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 255, 0),
-                    2
-                )
+        for landmark in hand:
+            features.extend([
+                landmark.x - wrist.x,
+                landmark.y - wrist.y,
+                landmark.z - wrist.z
+            ])
 
-                cv2.putText(
-                    frame,
-                    "Samples are being recorded",
-                    (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2
-                )
+        if elapsed - last_sample_time >= SAMPLE_INTERVAL:
+            data.append(features)
+            last_sample_time = elapsed
 
-                mp_landmarks = landmarks
+    cv2.putText(
+        frame,
+        f"Collecting: {gesture}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 255, 0),
+        2
+    )
 
-                h, w, _ = frame.shape
-                points = []
+    cv2.putText(
+        frame,
+        f"Time remaining: {remaining:.1f}s",
+        (20, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
 
-                for landmark in mp_landmarks:
-                    points.append(
-                        (int(landmark.x * w), int(landmark.y * h))
-                    )
+    cv2.putText(
+        frame,
+        "Vary position, orientation & rotation",
+        (20, 120),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 255),
+        2
+    )
 
-                for connection in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
-                    start = points[connection.start]
-                    end = points[connection.end]
-                    cv2.line(frame, start, end, (0, 255, 0), 2)
+    cv2.putText(
+        frame,
+        "Maintain the gesture shape",
+        (20, 150),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 255),
+        2
+    )
 
-                for point in points:
-                    cv2.circle(frame, point, 4, (0, 0, 255), -1)
+    cv2.imshow("Gesture Data Collection", frame)
 
-            cv2.imshow("Gesture Data Collection", frame)
-
-            key = cv2.waitKey(10) & 0xFF
-
-            if key == ord("q") or key == 27:
-                break
+    if cv2.waitKey(1) & 0xFF in [ord("q"), 27]:
+        break
 
 cap.release()
 cv2.destroyAllWindows()
+landmarker.close()
 
-print(f"\nFinished collecting {label} samples.")
+filename = os.path.join(DATA_DIR, f"{gesture}.csv")
+
+with open(filename, "w", newline="") as file:
+    writer = csv.writer(file)
+    writer.writerows(data)
+
+print("\nCollection complete.")
+print(f"Gesture: {gesture}")
+print(f"Samples collected: {len(data)}")
 print(f"Saved to: {filename}")
