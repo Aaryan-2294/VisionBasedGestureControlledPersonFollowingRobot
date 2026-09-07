@@ -24,7 +24,7 @@ GESTURES = ["FOLLOW", "STOP", "DOCK"]
 
 RECALIBRATION_HOLD_TIME = 3.0
 RECALIBRATION_COUNTDOWN = 5.0
-
+GESTURE_CONFIRMATION_TIME = 1.0
 
 os.makedirs(GESTURE_DATA_DIR, exist_ok=True)
 
@@ -145,9 +145,7 @@ def load_model():
         print("Run train_gesture_model.py first.")
         return None
 
-    model_data = joblib.load(MODEL_PATH)
-
-    return model_data
+    return joblib.load(MODEL_PATH)
 
 
 def predict_gesture(hand, model_data):
@@ -476,12 +474,17 @@ print("=" * 50)
 print()
 print("Normal operation is active.")
 print("FOLLOW / STOP / DOCK use the learned gestures.")
-print("Hold CLOSED FIST ✊ for 3 seconds to recalibrate.")
+print("Hold CLOSED FIST for 3 seconds to recalibrate.")
 print("Press Q or ESC to quit.")
 print()
 
 
 fist_start_time = None
+
+candidate_gesture = None
+gesture_start_time = None
+confirmed_gesture = None
+
 
 while True:
 
@@ -511,6 +514,7 @@ while True:
     threshold = 0.0
 
     fist_detected = False
+    confirmation_progress = 0.0
 
     if result.hand_landmarks:
 
@@ -522,8 +526,11 @@ while True:
 
         if fist_detected:
 
-            if fist_start_time is None:
-                fist_start_time = time.time()
+            fist_start_time = (
+                fist_start_time
+                if fist_start_time is not None
+                else time.time()
+            )
 
             held_time = time.time() - fist_start_time
 
@@ -531,6 +538,10 @@ while True:
                 held_time / RECALIBRATION_HOLD_TIME,
                 1.0
             )
+
+            candidate_gesture = None
+            gesture_start_time = None
+            confirmed_gesture = None
 
             put_text(
                 frame,
@@ -584,6 +595,10 @@ while True:
                 if model_data is None:
                     break
 
+                candidate_gesture = None
+                gesture_start_time = None
+                confirmed_gesture = None
+
                 print()
                 print("=" * 50)
                 print("NEW MODEL LOADED")
@@ -597,14 +612,67 @@ while True:
 
             fist_start_time = None
 
-            prediction, confidence, distance, threshold = predict_gesture(
-                hand,
-                model_data
+            prediction, confidence, distance, threshold = (
+                predict_gesture(
+                    hand,
+                    model_data
+                )
             )
+
+            current_time = time.time()
+
+            if prediction in GESTURES:
+
+                if prediction != candidate_gesture:
+
+                    candidate_gesture = prediction
+                    gesture_start_time = current_time
+
+                    if confirmed_gesture != prediction:
+                        confirmed_gesture = None
+
+                else:
+
+                    if gesture_start_time is not None:
+
+                        confirmation_progress = (
+                            current_time -
+                            gesture_start_time
+                        )
+
+                        if (
+                            confirmation_progress
+                            >= GESTURE_CONFIRMATION_TIME
+                        ):
+
+                            if confirmed_gesture != prediction:
+
+                                confirmed_gesture = prediction
+
+                                print()
+                                print("=" * 40)
+                                print(
+                                    f"COMMAND CONFIRMED: {prediction}"
+                                )
+                                print("=" * 40)
+                                print()
+
+            else:
+
+                candidate_gesture = None
+                gesture_start_time = None
+                confirmation_progress = 0.0
+
+                confirmed_gesture = None
 
     else:
 
         fist_start_time = None
+        candidate_gesture = None
+        gesture_start_time = None
+        confirmation_progress = 0.0
+        confirmed_gesture = None
+
 
     if not fist_detected:
 
@@ -638,12 +706,68 @@ while True:
                 0.7
             )
 
+        if candidate_gesture is not None:
+
+            progress = min(
+                confirmation_progress /
+                GESTURE_CONFIRMATION_TIME,
+                1.0
+            )
+
+            put_text(
+                frame,
+                f"Confirming: {candidate_gesture}",
+                180,
+                0.65
+            )
+
+            put_text(
+                frame,
+                f"Confirmation: {confirmation_progress:.1f} / 1.0 sec",
+                215,
+                0.65
+            )
+
+            bar_x = 20
+            bar_y = 240
+            bar_width = 400
+            bar_height = 25
+
+            cv2.rectangle(
+                frame,
+                (bar_x, bar_y),
+                (bar_x + bar_width, bar_y + bar_height),
+                (255, 255, 255),
+                2
+            )
+
+            cv2.rectangle(
+                frame,
+                (bar_x, bar_y),
+                (
+                    bar_x + int(bar_width * progress),
+                    bar_y + bar_height
+                ),
+                (0, 255, 0),
+                -1
+            )
+
+        if confirmed_gesture is not None:
+
+            put_text(
+                frame,
+                f"COMMAND: {confirmed_gesture}",
+                300,
+                0.75
+            )
+
         put_text(
             frame,
             "Hold CLOSED FIST for 3 sec to recalibrate",
-            185,
+            340,
             0.55
         )
+
 
     cv2.imshow(
         "Gesture Controller",
