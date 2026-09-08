@@ -14,7 +14,6 @@ from gesture_features import extract_features
 
 GESTURE_DATA_DIR = "gesture_data"
 HAND_MODEL_PATH = "hand_landmarker.task"
-POSE_MODEL_PATH = "pose_landmarker_full.task"
 MODEL_PATH = "gesture_model.pkl"
 
 GESTURE_DURATION = 10
@@ -23,13 +22,18 @@ SAMPLE_INTERVAL = 1.0 / SAMPLE_RATE
 
 GESTURES = ["FOLLOW", "STOP", "DOCK"]
 
-RECALIBRATION_HOLD_TIME = 3.0
 RECALIBRATION_COUNTDOWN = 5.0
 GESTURE_CONFIRMATION_TIME = 1.0
 
-TARGET_LOCK_HOLD_TIME = 3.0
-POSE_UPDATE_INTERVAL = 4
-TARGET_VISIBILITY_THRESHOLD = 0.5
+# Time a CLOSED FIST must be held (while IDLE) to lock in a new target.
+PAIRING_HOLD_TIME = 3.0
+
+# Max normalized-coordinate distance a hand's wrist may move between frames
+# and still be considered the same tracked target. There is no true person
+# re-identification here (MediaPipe only tracks a single hand at a time), so
+# this is a positional-continuity heuristic. Tune it if the target is being
+# "lost" too easily, or if a bystander's hand is too easily accepted.
+MAX_TARGET_DISTANCE = 0.15
 
 os.makedirs(GESTURE_DATA_DIR, exist_ok=True)
 
@@ -48,29 +52,11 @@ options = vision.HandLandmarkerOptions(
 
 landmarker = vision.HandLandmarker.create_from_options(options)
 
-pose_base_options = python.BaseOptions(
-    model_asset_path=POSE_MODEL_PATH
-)
-
-pose_options = vision.PoseLandmarkerOptions(
-    base_options=pose_base_options,
-    running_mode=vision.RunningMode.VIDEO,
-    num_poses=4,
-    min_pose_detection_confidence=0.5,
-    min_pose_presence_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-
-pose_landmarker = vision.PoseLandmarker.create_from_options(
-    pose_options
-)
-
 cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
     print("Could not open camera")
     landmarker.close()
-    pose_landmarker.close()
     exit()
 
 
@@ -162,122 +148,6 @@ def put_text(frame, text, y, scale=0.7):
     )
 
 
-
-def get_pose_center(pose, width, height):
-    important_points = [11, 12, 23, 24]
-    points = []
-
-    for index in important_points:
-        landmark = pose[index]
-
-        if landmark.visibility > TARGET_VISIBILITY_THRESHOLD:
-            points.append(
-                (
-                    int(landmark.x * width),
-                    int(landmark.y * height)
-                )
-            )
-
-    if not points:
-        return None
-
-    x = sum(point[0] for point in points) // len(points)
-    y = sum(point[1] for point in points) // len(points)
-
-    return x, y
-
-
-def get_pose_box(pose, width, height):
-    visible_points = []
-
-    for landmark in pose:
-        if landmark.visibility > TARGET_VISIBILITY_THRESHOLD:
-            x = int(landmark.x * width)
-            y = int(landmark.y * height)
-
-            if 0 <= x < width and 0 <= y < height:
-                visible_points.append((x, y))
-
-    if not visible_points:
-        return None
-
-    xs = [point[0] for point in visible_points]
-    ys = [point[1] for point in visible_points]
-
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def associate_hand_with_pose(hand, poses, width, height):
-    wrist = hand[0]
-    hand_position = (
-        int(wrist.x * width),
-        int(wrist.y * height)
-    )
-
-    best_index = None
-    best_distance = float("inf")
-
-    for index, pose in enumerate(poses):
-        center = get_pose_center(pose, width, height)
-        box = get_pose_box(pose, width, height)
-
-        if center is None or box is None:
-            continue
-
-        x1, y1, x2, y2 = box
-
-        margin_x = max(120, int((x2 - x1) * 0.35))
-        margin_y = max(160, int((y2 - y1) * 0.40))
-
-        inside_region = (
-            x1 - margin_x <= hand_position[0] <= x2 + margin_x
-            and
-            y1 - margin_y <= hand_position[1] <= y2 + margin_y
-        )
-
-        if not inside_region:
-            continue
-
-        current_distance = (
-            (hand_position[0] - center[0]) ** 2 +
-            (hand_position[1] - center[1]) ** 2
-        ) ** 0.5
-
-        if current_distance < best_distance:
-            best_distance = current_distance
-            best_index = index
-
-    return best_index
-
-
-def draw_target(frame, pose, width, height):
-    box = get_pose_box(pose, width, height)
-
-    if box is None:
-        return
-
-    x1, y1, x2, y2 = box
-
-    cv2.rectangle(
-        frame,
-        (x1, y1),
-        (x2, y2),
-        (0, 255, 255),
-        2
-    )
-
-    center = get_pose_center(pose, width, height)
-
-    if center is not None:
-        cv2.circle(
-            frame,
-            center,
-            5,
-            (0, 255, 255),
-            -1
-        )
-
-
 def load_model():
     if not os.path.exists(MODEL_PATH):
         print("Gesture model not found.")
@@ -330,6 +200,22 @@ def predict_gesture(hand, model_data):
         prediction = "REJECTED"
 
     return prediction, confidence, distance, threshold
+
+
+def hand_position(hand):
+    # Wrist landmark. Chosen over an all-landmark centroid because the wrist
+    # stays relatively stable across different gestures (fingers move a lot,
+    # the wrist doesn't), which makes it a steadier anchor for "is this the
+    # same person's hand as before".
+    wrist = hand[0]
+    return (wrist.x, wrist.y)
+
+
+def position_distance(p1, p2):
+    return (
+        (p1[0] - p2[0]) ** 2 +
+        (p1[1] - p2[1]) ** 2
+    ) ** 0.5
 
 
 def run_calibration():
@@ -611,26 +497,28 @@ print("=" * 50)
 print("Gesture Controller")
 print("=" * 50)
 print()
-print("Normal operation is active.")
-print("FOLLOW / STOP / DOCK use the learned gestures.")
-print("Hold CLOSED FIST for 3 seconds to lock target and recalibrate.")
+print("Robot starts IDLE (no target).")
+print(f"Show a CLOSED FIST and hold it {PAIRING_HOLD_TIME:.0f}s to pair.")
+print("Once paired, FOLLOW / STOP / DOCK gestures")
+print("from the target are recognized; everyone")
+print("else's gestures are ignored.")
+print("Target gesturing DOCK relinquishes the")
+print("target and returns the robot to IDLE.")
+print("Press C to recalibrate (only while IDLE).")
 print("Press Q or ESC to quit.")
 print()
 
 
-fist_start_time = None
+# "IDLE": no target paired, waiting for someone to pair via closed fist.
+# "ACTIVE": a target is paired and being tracked/gestured to.
+state = "IDLE"
+target_position = None
+
+pairing_fist_start_time = None
 
 candidate_gesture = None
 gesture_start_time = None
 confirmed_gesture = None
-
-pose_timestamp = 0
-frame_counter = 0
-poses = []
-
-target_locked = False
-target_pose_index = None
-target_center = None
 
 
 while True:
@@ -655,61 +543,13 @@ while True:
 
     result = landmarker.detect(mp_image)
 
-    frame_counter += 1
-
-    if frame_counter % POSE_UPDATE_INTERVAL == 0:
-
-        pose_timestamp += 33
-
-        pose_result = pose_landmarker.detect_for_video(
-            mp_image,
-            pose_timestamp
-        )
-
-        poses = pose_result.pose_landmarks
-
-        if target_locked and target_center is not None and poses:
-
-            closest_index = None
-            closest_distance = float("inf")
-
-            for index, pose in enumerate(poses):
-
-                center = get_pose_center(
-                    pose,
-                    frame.shape[1],
-                    frame.shape[0]
-                )
-
-                if center is None:
-                    continue
-
-                current_distance = (
-                    (center[0] - target_center[0]) ** 2 +
-                    (center[1] - target_center[1]) ** 2
-                ) ** 0.5
-
-                if current_distance < closest_distance:
-
-                    closest_distance = current_distance
-                    closest_index = index
-
-            if closest_index is not None:
-
-                target_pose_index = closest_index
-                target_center = get_pose_center(
-                    poses[target_pose_index],
-                    frame.shape[1],
-                    frame.shape[0]
-                )
-
     prediction = "No hand"
     confidence = 0.0
-    gesture_distance = 0.0
+    distance = 0.0
     threshold = 0.0
-
-    fist_detected = False
     confirmation_progress = 0.0
+    pairing_progress = 0.0
+    is_target = False
 
     if result.hand_landmarks:
 
@@ -717,54 +557,246 @@ while True:
 
         draw_hand(frame, hand)
 
+        current_position = hand_position(hand)
         fist_detected = is_closed_fist(hand)
 
-        if not target_locked and fist_detected:
+        if state == "IDLE":
 
-            hand_pose_index = (
-                associate_hand_with_pose(
-                    hand,
-                    poses,
-                    frame.shape[1],
-                    frame.shape[0]
+            candidate_gesture = None
+            gesture_start_time = None
+            confirmed_gesture = None
+
+            if fist_detected:
+
+                pairing_fist_start_time = (
+                    pairing_fist_start_time
+                    if pairing_fist_start_time is not None
+                    else time.time()
                 )
-                if poses else None
-            )
 
-            if hand_pose_index is not None:
+                held_time = time.time() - pairing_fist_start_time
 
-                if fist_start_time is None:
-                    fist_start_time = time.time()
-
-                held_time = time.time() - fist_start_time
-
-                progress = min(
-                    held_time / TARGET_LOCK_HOLD_TIME,
+                pairing_progress = min(
+                    held_time / PAIRING_HOLD_TIME,
                     1.0
                 )
 
+                if held_time >= PAIRING_HOLD_TIME:
+
+                    # Lock the new target first, then recalibrate all three
+                    # learned gestures for that target. This is used both for
+                    # the first target and after DOCK releases the previous
+                    # target.
+                    state = "ACTIVE"
+                    target_position = current_position
+                    pairing_fist_start_time = None
+
+                    print()
+                    print("=" * 40)
+                    print("TARGET PAIRED")
+                    print("Starting gesture recalibration...")
+                    print("=" * 40)
+                    print()
+
+                    success = run_calibration()
+
+                    if not success:
+                        state = "IDLE"
+                        target_position = None
+                        candidate_gesture = None
+                        gesture_start_time = None
+                        confirmed_gesture = None
+                        pairing_fist_start_time = None
+                        break
+
+                    model_data = load_model()
+
+                    if model_data is None:
+                        state = "IDLE"
+                        target_position = None
+                        candidate_gesture = None
+                        gesture_start_time = None
+                        confirmed_gesture = None
+                        pairing_fist_start_time = None
+                        break
+
+                    candidate_gesture = None
+                    gesture_start_time = None
+                    confirmed_gesture = None
+
+                    print()
+                    print("=" * 50)
+                    print("NEW GESTURE MODEL LOADED")
+                    print("Returning to ACTIVE mode.")
+                    print("=" * 50)
+                    print()
+
+            else:
+                pairing_fist_start_time = None
+
+        else:  # state == "ACTIVE"
+
+            is_target = (
+                position_distance(current_position, target_position)
+                <= MAX_TARGET_DISTANCE
+            )
+
+            if is_target:
+
+                target_position = current_position
+
+                prediction, confidence, distance, threshold = (
+                    predict_gesture(hand, model_data)
+                )
+
+                current_time = time.time()
+
+                if prediction in GESTURES:
+
+                    if prediction != candidate_gesture:
+
+                        candidate_gesture = prediction
+                        gesture_start_time = current_time
+
+                        if confirmed_gesture != prediction:
+                            confirmed_gesture = None
+
+                    else:
+
+                        if gesture_start_time is not None:
+
+                            confirmation_progress = (
+                                current_time - gesture_start_time
+                            )
+
+                            if (
+                                confirmation_progress
+                                >= GESTURE_CONFIRMATION_TIME
+                            ):
+
+                                if confirmed_gesture != prediction:
+
+                                    confirmed_gesture = prediction
+
+                                    print()
+                                    print("=" * 40)
+                                    print(f"COMMAND CONFIRMED: {prediction}")
+                                    print("=" * 40)
+                                    print()
+
+                                    if prediction == "DOCK":
+
+                                        print()
+                                        print("=" * 50)
+                                        print("DOCK confirmed.")
+                                        print("Relinquishing target.")
+                                        print("Returning to IDLE.")
+                                        print("=" * 50)
+                                        print()
+
+                                        state = "IDLE"
+                                        target_position = None
+                                        candidate_gesture = None
+                                        gesture_start_time = None
+                                        confirmed_gesture = None
+                                        pairing_fist_start_time = None
+
+                else:
+                    candidate_gesture = None
+                    gesture_start_time = None
+                    confirmed_gesture = None
+
+            else:
                 candidate_gesture = None
                 gesture_start_time = None
-                confirmed_gesture = None
 
-                put_text(
-                    frame,
-                    "TARGET ALLOCATION",
-                    40,
-                    0.8
+    else:
+
+        if state == "IDLE":
+            pairing_fist_start_time = None
+        else:
+            candidate_gesture = None
+            gesture_start_time = None
+
+
+    # ---- overlay drawing ----
+
+    if state == "IDLE":
+
+        put_text(frame, "STATE: IDLE (no target)", 40, 0.8)
+
+        if pairing_fist_start_time is not None:
+
+            held_time = time.time() - pairing_fist_start_time
+
+            put_text(
+                frame,
+                f"Pairing hold: {held_time:.1f} / {PAIRING_HOLD_TIME:.1f} sec",
+                80,
+                0.7
+            )
+
+            bar_x, bar_y, bar_width, bar_height = 20, 110, 400, 30
+
+            cv2.rectangle(
+                frame,
+                (bar_x, bar_y),
+                (bar_x + bar_width, bar_y + bar_height),
+                (255, 255, 255),
+                2
+            )
+
+            cv2.rectangle(
+                frame,
+                (bar_x, bar_y),
+                (
+                    bar_x + int(bar_width * pairing_progress),
+                    bar_y + bar_height
+                ),
+                (0, 255, 0),
+                -1
+            )
+
+        else:
+            put_text(
+                frame,
+                "Show CLOSED FIST for 3s to pair",
+                80,
+                0.6
+            )
+
+        put_text(
+            frame,
+            "Press C to recalibrate (idle only)",
+            115,
+            0.55
+        )
+
+    else:
+
+        if is_target:
+
+            put_text(frame, "STATE: ACTIVE - target locked", 40, 0.8)
+            put_text(frame, f"Prediction: {prediction}", 75, 0.7)
+            put_text(frame, f"Confidence: {confidence:.2f}", 105, 0.6)
+            put_text(frame, f"Distance: {distance:.3f}", 135, 0.6)
+            put_text(frame, f"Threshold: {threshold:.3f}", 165, 0.6)
+
+            if candidate_gesture is not None:
+
+                progress = min(
+                    confirmation_progress / GESTURE_CONFIRMATION_TIME,
+                    1.0
                 )
 
                 put_text(
                     frame,
-                    f"Hold: {held_time:.1f} / 3.0 sec",
-                    80,
-                    0.7
+                    f"Confirming: {candidate_gesture}",
+                    200,
+                    0.6
                 )
 
-                bar_x = 20
-                bar_y = 110
-                bar_width = 400
-                bar_height = 30
+                bar_x, bar_y, bar_width, bar_height = 20, 220, 400, 25
 
                 cv2.rectangle(
                     frame,
@@ -785,237 +817,24 @@ while True:
                     -1
                 )
 
-                if held_time >= TARGET_LOCK_HOLD_TIME:
+            if confirmed_gesture is not None:
+                put_text(frame, f"COMMAND: {confirmed_gesture}", 280, 0.75)
 
-                    target_locked = True
-                    target_pose_index = hand_pose_index
-                    target_center = get_pose_center(
-                        poses[target_pose_index],
-                        frame.shape[1],
-                        frame.shape[0]
-                    )
+        elif result.hand_landmarks:
 
-                    fist_start_time = None
-
-                    print()
-                    print("=" * 50)
-                    print("TARGET LOCKED")
-                    print(f"Target person index: {target_pose_index}")
-                    print("Starting gesture recalibration...")
-                    print("=" * 50)
-                    print()
-
-                    success = run_calibration()
-
-                    if not success:
-                        break
-
-                    model_data = load_model()
-
-                    if model_data is None:
-                        break
-
-                    candidate_gesture = None
-                    gesture_start_time = None
-                    confirmation_progress = 0.0
-                    confirmed_gesture = None
-
-                    print()
-                    print("=" * 50)
-                    print("NEW MODEL LOADED")
-                    print("Target remains locked.")
-                    print("Returning to normal operation.")
-                    print("=" * 50)
-                    print()
-
-            else:
-                fist_start_time = None
-
-        elif fist_detected:
-
-            # A locked target's fist is not a new allocation trigger.
-            fist_start_time = None
+            put_text(frame, "STATE: ACTIVE - target locked", 40, 0.8)
+            put_text(frame, "Hand detected: NOT the target", 75, 0.7)
+            put_text(frame, "Gesture ignored", 105, 0.6)
 
         else:
 
-            fist_start_time = None
-
-            # Keep the original gesture pipeline independent from pose
-            # association so intermittent pose detection cannot reset
-            # gesture recognition.
-            prediction, confidence, gesture_distance, threshold = (
-                predict_gesture(
-                    hand,
-                    model_data
-                )
-            )
-
-            current_time = time.time()
-
-            if prediction in GESTURES:
-
-                if prediction != candidate_gesture:
-
-                    candidate_gesture = prediction
-                    gesture_start_time = current_time
-
-                    if confirmed_gesture != prediction:
-                        confirmed_gesture = None
-
-                else:
-
-                    if gesture_start_time is not None:
-
-                        confirmation_progress = (
-                            current_time -
-                            gesture_start_time
-                        )
-
-                        if (
-                            confirmation_progress
-                            >= GESTURE_CONFIRMATION_TIME
-                        ):
-
-                            if confirmed_gesture != prediction:
-
-                                confirmed_gesture = prediction
-
-                                print()
-                                print("=" * 40)
-                                print(
-                                    f"COMMAND CONFIRMED: {prediction}"
-                                )
-                                print("=" * 40)
-                                print()
-
-            else:
-
-                candidate_gesture = None
-                gesture_start_time = None
-                confirmation_progress = 0.0
-                confirmed_gesture = None
-
-    else:
-
-        fist_detected = False
-        fist_start_time = None
-        candidate_gesture = None
-        gesture_start_time = None
-        confirmation_progress = 0.0
-        confirmed_gesture = None
-
-
-    if target_locked and poses and target_pose_index is not None:
-
-        if target_pose_index < len(poses):
-
-            draw_target(
-                frame,
-                poses[target_pose_index],
-                frame.shape[1],
-                frame.shape[0]
-            )
-
-    if target_locked:
+            put_text(frame, "STATE: ACTIVE - target locked", 40, 0.8)
+            put_text(frame, "Target not visible", 75, 0.7)
 
         put_text(
             frame,
-            "TARGET LOCKED",
-            375,
-            0.7
-        )
-
-    if not fist_detected:
-
-        put_text(
-            frame,
-            f"Prediction: {prediction}",
-            40,
-            0.8
-        )
-
-        put_text(
-            frame,
-            f"Confidence: {confidence:.2f}",
-            75,
-            0.7
-        )
-
-        put_text(
-            frame,
-            f"Distance: {gesture_distance:.3f}",
-            110,
-            0.7
-        )
-
-        if result.hand_landmarks:
-
-            put_text(
-                frame,
-                f"Threshold: {threshold:.3f}",
-                145,
-                0.7
-            )
-
-        if candidate_gesture is not None:
-
-            progress = min(
-                confirmation_progress /
-                GESTURE_CONFIRMATION_TIME,
-                1.0
-            )
-
-            put_text(
-                frame,
-                f"Confirming: {candidate_gesture}",
-                180,
-                0.65
-            )
-
-            put_text(
-                frame,
-                f"Confirmation: {confirmation_progress:.1f} / 1.0 sec",
-                215,
-                0.65
-            )
-
-            bar_x = 20
-            bar_y = 240
-            bar_width = 400
-            bar_height = 25
-
-            cv2.rectangle(
-                frame,
-                (bar_x, bar_y),
-                (bar_x + bar_width, bar_y + bar_height),
-                (255, 255, 255),
-                2
-            )
-
-            cv2.rectangle(
-                frame,
-                (bar_x, bar_y),
-                (
-                    bar_x + int(bar_width * progress),
-                    bar_y + bar_height
-                ),
-                (0, 255, 0),
-                -1
-            )
-
-        if confirmed_gesture is not None:
-
-            put_text(
-                frame,
-                f"COMMAND: {confirmed_gesture}",
-                300,
-                0.75
-            )
-
-        put_text(
-            frame,
-            "Hold CLOSED FIST for 3 sec to recalibrate",
-            340,
+            "Target gestures DOCK to release",
+            320,
             0.55
         )
 
@@ -1030,11 +849,34 @@ while True:
     if key == ord("q") or key == 27:
         break
 
+    if key == ord("c") and state == "IDLE":
+
+        success = run_calibration()
+
+        if not success:
+            break
+
+        model_data = load_model()
+
+        if model_data is None:
+            break
+
+        candidate_gesture = None
+        gesture_start_time = None
+        confirmed_gesture = None
+        pairing_fist_start_time = None
+
+        print()
+        print("=" * 50)
+        print("NEW MODEL LOADED")
+        print("Returning to IDLE.")
+        print("=" * 50)
+        print()
+
 
 cap.release()
 cv2.destroyAllWindows()
 landmarker.close()
-pose_landmarker.close()
 
 print()
 print("Gesture controller stopped.")
