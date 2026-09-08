@@ -24,6 +24,7 @@ GESTURES = ["FOLLOW", "STOP", "DOCK"]
 
 RECALIBRATION_COUNTDOWN = 5.0
 GESTURE_CONFIRMATION_TIME = 1.0
+REJECTION_GRACE_TIME = 0.3
 
 # Time a CLOSED FIST must be held (while IDLE) to lock in a new target.
 PAIRING_HOLD_TIME = 3.0
@@ -519,6 +520,7 @@ pairing_fist_start_time = None
 candidate_gesture = None
 gesture_start_time = None
 confirmed_gesture = None
+rejection_start_time = None
 
 
 while True:
@@ -653,8 +655,11 @@ while True:
 
                 if prediction in GESTURES:
 
-                    if prediction != candidate_gesture:
+                    # Tolerate a brief classifier dropout without restarting
+                    # the 1-second confirmation timer.
+                    rejection_start_time = None
 
+                    if prediction != candidate_gesture:
                         candidate_gesture = prediction
                         gesture_start_time = current_time
 
@@ -662,20 +667,13 @@ while True:
                             confirmed_gesture = None
 
                     else:
-
                         if gesture_start_time is not None:
-
                             confirmation_progress = (
                                 current_time - gesture_start_time
                             )
 
-                            if (
-                                confirmation_progress
-                                >= GESTURE_CONFIRMATION_TIME
-                            ):
-
+                            if confirmation_progress >= GESTURE_CONFIRMATION_TIME:
                                 if confirmed_gesture != prediction:
-
                                     confirmed_gesture = prediction
 
                                     print()
@@ -685,7 +683,6 @@ while True:
                                     print()
 
                                     if prediction == "DOCK":
-
                                         print()
                                         print("=" * 50)
                                         print("DOCK confirmed.")
@@ -699,12 +696,23 @@ while True:
                                         candidate_gesture = None
                                         gesture_start_time = None
                                         confirmed_gesture = None
+                                        rejection_start_time = None
                                         pairing_fist_start_time = None
 
                 else:
-                    candidate_gesture = None
-                    gesture_start_time = None
-                    confirmed_gesture = None
+                    # A single rejected frame no longer resets confirmation.
+                    # Reset only if rejection lasts longer than the grace period.
+                    if candidate_gesture is not None:
+                        if rejection_start_time is None:
+                            rejection_start_time = current_time
+
+                        if current_time - rejection_start_time > REJECTION_GRACE_TIME:
+                            candidate_gesture = None
+                            gesture_start_time = None
+                            confirmed_gesture = None
+                            rejection_start_time = None
+                    else:
+                        rejection_start_time = None
 
             else:
                 candidate_gesture = None

@@ -14,3 +14,4 @@ log/
 .DS_Store
 
 vision/gesture_data/
+gesture_model.pkl
