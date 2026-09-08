@@ -14,6 +14,7 @@ from gesture_features import extract_features
 
 GESTURE_DATA_DIR = "gesture_data"
 HAND_MODEL_PATH = "hand_landmarker.task"
+POSE_MODEL_PATH = "pose_landmarker_full.task"
 MODEL_PATH = "gesture_model.pkl"
 
 GESTURE_DURATION = 10
@@ -25,6 +26,10 @@ GESTURES = ["FOLLOW", "STOP", "DOCK"]
 RECALIBRATION_HOLD_TIME = 3.0
 RECALIBRATION_COUNTDOWN = 5.0
 GESTURE_CONFIRMATION_TIME = 1.0
+
+TARGET_LOCK_HOLD_TIME = 3.0
+POSE_UPDATE_INTERVAL = 4
+TARGET_VISIBILITY_THRESHOLD = 0.5
 
 os.makedirs(GESTURE_DATA_DIR, exist_ok=True)
 
@@ -43,11 +48,29 @@ options = vision.HandLandmarkerOptions(
 
 landmarker = vision.HandLandmarker.create_from_options(options)
 
+pose_base_options = python.BaseOptions(
+    model_asset_path=POSE_MODEL_PATH
+)
+
+pose_options = vision.PoseLandmarkerOptions(
+    base_options=pose_base_options,
+    running_mode=vision.RunningMode.VIDEO,
+    num_poses=4,
+    min_pose_detection_confidence=0.5,
+    min_pose_presence_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+pose_landmarker = vision.PoseLandmarker.create_from_options(
+    pose_options
+)
+
 cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
     print("Could not open camera")
     landmarker.close()
+    pose_landmarker.close()
     exit()
 
 
@@ -137,6 +160,122 @@ def put_text(frame, text, y, scale=0.7):
         (255, 255, 255),
         2
     )
+
+
+
+def get_pose_center(pose, width, height):
+    important_points = [11, 12, 23, 24]
+    points = []
+
+    for index in important_points:
+        landmark = pose[index]
+
+        if landmark.visibility > TARGET_VISIBILITY_THRESHOLD:
+            points.append(
+                (
+                    int(landmark.x * width),
+                    int(landmark.y * height)
+                )
+            )
+
+    if not points:
+        return None
+
+    x = sum(point[0] for point in points) // len(points)
+    y = sum(point[1] for point in points) // len(points)
+
+    return x, y
+
+
+def get_pose_box(pose, width, height):
+    visible_points = []
+
+    for landmark in pose:
+        if landmark.visibility > TARGET_VISIBILITY_THRESHOLD:
+            x = int(landmark.x * width)
+            y = int(landmark.y * height)
+
+            if 0 <= x < width and 0 <= y < height:
+                visible_points.append((x, y))
+
+    if not visible_points:
+        return None
+
+    xs = [point[0] for point in visible_points]
+    ys = [point[1] for point in visible_points]
+
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def associate_hand_with_pose(hand, poses, width, height):
+    wrist = hand[0]
+    hand_position = (
+        int(wrist.x * width),
+        int(wrist.y * height)
+    )
+
+    best_index = None
+    best_distance = float("inf")
+
+    for index, pose in enumerate(poses):
+        center = get_pose_center(pose, width, height)
+        box = get_pose_box(pose, width, height)
+
+        if center is None or box is None:
+            continue
+
+        x1, y1, x2, y2 = box
+
+        margin_x = max(120, int((x2 - x1) * 0.35))
+        margin_y = max(160, int((y2 - y1) * 0.40))
+
+        inside_region = (
+            x1 - margin_x <= hand_position[0] <= x2 + margin_x
+            and
+            y1 - margin_y <= hand_position[1] <= y2 + margin_y
+        )
+
+        if not inside_region:
+            continue
+
+        current_distance = (
+            (hand_position[0] - center[0]) ** 2 +
+            (hand_position[1] - center[1]) ** 2
+        ) ** 0.5
+
+        if current_distance < best_distance:
+            best_distance = current_distance
+            best_index = index
+
+    return best_index
+
+
+def draw_target(frame, pose, width, height):
+    box = get_pose_box(pose, width, height)
+
+    if box is None:
+        return
+
+    x1, y1, x2, y2 = box
+
+    cv2.rectangle(
+        frame,
+        (x1, y1),
+        (x2, y2),
+        (0, 255, 255),
+        2
+    )
+
+    center = get_pose_center(pose, width, height)
+
+    if center is not None:
+        cv2.circle(
+            frame,
+            center,
+            5,
+            (0, 255, 255),
+            -1
+        )
 
 
 def load_model():
@@ -474,7 +613,7 @@ print("=" * 50)
 print()
 print("Normal operation is active.")
 print("FOLLOW / STOP / DOCK use the learned gestures.")
-print("Hold CLOSED FIST for 3 seconds to recalibrate.")
+print("Hold CLOSED FIST for 3 seconds to lock target and recalibrate.")
 print("Press Q or ESC to quit.")
 print()
 
@@ -484,6 +623,14 @@ fist_start_time = None
 candidate_gesture = None
 gesture_start_time = None
 confirmed_gesture = None
+
+pose_timestamp = 0
+frame_counter = 0
+poses = []
+
+target_locked = False
+target_pose_index = None
+target_center = None
 
 
 while True:
@@ -508,9 +655,57 @@ while True:
 
     result = landmarker.detect(mp_image)
 
+    frame_counter += 1
+
+    if frame_counter % POSE_UPDATE_INTERVAL == 0:
+
+        pose_timestamp += 33
+
+        pose_result = pose_landmarker.detect_for_video(
+            mp_image,
+            pose_timestamp
+        )
+
+        poses = pose_result.pose_landmarks
+
+        if target_locked and target_center is not None and poses:
+
+            closest_index = None
+            closest_distance = float("inf")
+
+            for index, pose in enumerate(poses):
+
+                center = get_pose_center(
+                    pose,
+                    frame.shape[1],
+                    frame.shape[0]
+                )
+
+                if center is None:
+                    continue
+
+                current_distance = (
+                    (center[0] - target_center[0]) ** 2 +
+                    (center[1] - target_center[1]) ** 2
+                ) ** 0.5
+
+                if current_distance < closest_distance:
+
+                    closest_distance = current_distance
+                    closest_index = index
+
+            if closest_index is not None:
+
+                target_pose_index = closest_index
+                target_center = get_pose_center(
+                    poses[target_pose_index],
+                    frame.shape[1],
+                    frame.shape[0]
+                )
+
     prediction = "No hand"
     confidence = 0.0
-    distance = 0.0
+    gesture_distance = 0.0
     threshold = 0.0
 
     fist_detected = False
@@ -524,95 +719,131 @@ while True:
 
         fist_detected = is_closed_fist(hand)
 
-        if fist_detected:
+        if not target_locked and fist_detected:
 
-            fist_start_time = (
-                fist_start_time
-                if fist_start_time is not None
-                else time.time()
+            hand_pose_index = (
+                associate_hand_with_pose(
+                    hand,
+                    poses,
+                    frame.shape[1],
+                    frame.shape[0]
+                )
+                if poses else None
             )
 
-            held_time = time.time() - fist_start_time
+            if hand_pose_index is not None:
 
-            progress = min(
-                held_time / RECALIBRATION_HOLD_TIME,
-                1.0
-            )
+                if fist_start_time is None:
+                    fist_start_time = time.time()
 
-            candidate_gesture = None
-            gesture_start_time = None
-            confirmed_gesture = None
+                held_time = time.time() - fist_start_time
 
-            put_text(
-                frame,
-                "CLOSED FIST DETECTED",
-                40,
-                0.8
-            )
-
-            put_text(
-                frame,
-                f"Hold: {held_time:.1f} / 3.0 sec",
-                80,
-                0.7
-            )
-
-            bar_x = 20
-            bar_y = 110
-            bar_width = 400
-            bar_height = 30
-
-            cv2.rectangle(
-                frame,
-                (bar_x, bar_y),
-                (bar_x + bar_width, bar_y + bar_height),
-                (255, 255, 255),
-                2
-            )
-
-            cv2.rectangle(
-                frame,
-                (bar_x, bar_y),
-                (
-                    bar_x + int(bar_width * progress),
-                    bar_y + bar_height
-                ),
-                (0, 255, 0),
-                -1
-            )
-
-            if held_time >= RECALIBRATION_HOLD_TIME:
-
-                fist_start_time = None
-
-                success = run_calibration()
-
-                if not success:
-                    break
-
-                model_data = load_model()
-
-                if model_data is None:
-                    break
+                progress = min(
+                    held_time / TARGET_LOCK_HOLD_TIME,
+                    1.0
+                )
 
                 candidate_gesture = None
                 gesture_start_time = None
                 confirmed_gesture = None
 
-                print()
-                print("=" * 50)
-                print("NEW MODEL LOADED")
-                print("Returning to normal operation.")
-                print("=" * 50)
-                print()
+                put_text(
+                    frame,
+                    "TARGET ALLOCATION",
+                    40,
+                    0.8
+                )
 
-                continue
+                put_text(
+                    frame,
+                    f"Hold: {held_time:.1f} / 3.0 sec",
+                    80,
+                    0.7
+                )
+
+                bar_x = 20
+                bar_y = 110
+                bar_width = 400
+                bar_height = 30
+
+                cv2.rectangle(
+                    frame,
+                    (bar_x, bar_y),
+                    (bar_x + bar_width, bar_y + bar_height),
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.rectangle(
+                    frame,
+                    (bar_x, bar_y),
+                    (
+                        bar_x + int(bar_width * progress),
+                        bar_y + bar_height
+                    ),
+                    (0, 255, 0),
+                    -1
+                )
+
+                if held_time >= TARGET_LOCK_HOLD_TIME:
+
+                    target_locked = True
+                    target_pose_index = hand_pose_index
+                    target_center = get_pose_center(
+                        poses[target_pose_index],
+                        frame.shape[1],
+                        frame.shape[0]
+                    )
+
+                    fist_start_time = None
+
+                    print()
+                    print("=" * 50)
+                    print("TARGET LOCKED")
+                    print(f"Target person index: {target_pose_index}")
+                    print("Starting gesture recalibration...")
+                    print("=" * 50)
+                    print()
+
+                    success = run_calibration()
+
+                    if not success:
+                        break
+
+                    model_data = load_model()
+
+                    if model_data is None:
+                        break
+
+                    candidate_gesture = None
+                    gesture_start_time = None
+                    confirmation_progress = 0.0
+                    confirmed_gesture = None
+
+                    print()
+                    print("=" * 50)
+                    print("NEW MODEL LOADED")
+                    print("Target remains locked.")
+                    print("Returning to normal operation.")
+                    print("=" * 50)
+                    print()
+
+            else:
+                fist_start_time = None
+
+        elif fist_detected:
+
+            # A locked target's fist is not a new allocation trigger.
+            fist_start_time = None
 
         else:
 
             fist_start_time = None
 
-            prediction, confidence, distance, threshold = (
+            # Keep the original gesture pipeline independent from pose
+            # association so intermittent pose detection cannot reset
+            # gesture recognition.
+            prediction, confidence, gesture_distance, threshold = (
                 predict_gesture(
                     hand,
                     model_data
@@ -662,17 +893,37 @@ while True:
                 candidate_gesture = None
                 gesture_start_time = None
                 confirmation_progress = 0.0
-
                 confirmed_gesture = None
 
     else:
 
+        fist_detected = False
         fist_start_time = None
         candidate_gesture = None
         gesture_start_time = None
         confirmation_progress = 0.0
         confirmed_gesture = None
 
+
+    if target_locked and poses and target_pose_index is not None:
+
+        if target_pose_index < len(poses):
+
+            draw_target(
+                frame,
+                poses[target_pose_index],
+                frame.shape[1],
+                frame.shape[0]
+            )
+
+    if target_locked:
+
+        put_text(
+            frame,
+            "TARGET LOCKED",
+            375,
+            0.7
+        )
 
     if not fist_detected:
 
@@ -692,7 +943,7 @@ while True:
 
         put_text(
             frame,
-            f"Distance: {distance:.3f}",
+            f"Distance: {gesture_distance:.3f}",
             110,
             0.7
         )
@@ -783,6 +1034,7 @@ while True:
 cap.release()
 cv2.destroyAllWindows()
 landmarker.close()
+pose_landmarker.close()
 
 print()
 print("Gesture controller stopped.")
