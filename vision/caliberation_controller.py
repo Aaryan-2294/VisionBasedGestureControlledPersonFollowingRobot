@@ -5,6 +5,7 @@ import os
 import joblib
 import numpy as np
 import subprocess
+import socket
 import mediapipe as mp
 
 try:
@@ -41,6 +42,8 @@ PAIRING_HOLD_TIME = 3.0
 PERSON_MODEL_PATH = "yolo11n.pt"
 PERSON_TRACKER_CONFIG = "bytetrack.yaml"
 PERSON_CLASS_ID = 0
+# Unix socket used to send confirmed gestures to the ROS 2 bridge.
+GESTURE_SOCKET_PATH = "/tmp/vbgc_gesture.sock"
 
 os.makedirs(GESTURE_DATA_DIR, exist_ok=True)
 
@@ -318,6 +321,35 @@ def draw_people(frame, people, target_id=None):
             2
         )
 
+def send_gesture_to_ros(gesture):
+    """Send a confirmed gesture to the ROS 2 gesture publisher."""
+    if gesture not in GESTURES:
+        return False
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as gesture_socket:
+            gesture_socket.settimeout(1.0)
+            gesture_socket.connect(GESTURE_SOCKET_PATH)
+            gesture_socket.sendall(
+                (gesture + "\n").encode("utf-8")
+            )
+
+        print(f"ROS 2 gesture sent: {gesture}")
+        return True
+
+    except (
+        FileNotFoundError,
+        ConnectionRefusedError,
+        TimeoutError,
+        BrokenPipeError,
+        ConnectionResetError,
+        OSError,
+    ):
+        print(
+            f"Could not connect to ROS 2 gesture publisher at "
+            f"{GESTURE_SOCKET_PATH}"
+        )
+        return False
 
 def run_calibration():
 
@@ -796,6 +828,8 @@ while True:
                                     print(f"COMMAND CONFIRMED: {prediction}")
                                     print("=" * 40)
                                     print()
+
+                                    send_gesture_to_ros(prediction)
 
                                     if prediction == "DOCK":
                                         print()
