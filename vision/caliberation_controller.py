@@ -7,6 +7,11 @@ import numpy as np
 import subprocess
 import mediapipe as mp
 
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -29,12 +34,13 @@ REJECTION_GRACE_TIME = 0.3
 # Time a CLOSED FIST must be held (while IDLE) to lock in a new target.
 PAIRING_HOLD_TIME = 3.0
 
-# Max normalized-coordinate distance a hand's wrist may move between frames
-# and still be considered the same tracked target. There is no true person
-# re-identification here (MediaPipe only tracks a single hand at a time), so
-# this is a positional-continuity heuristic. Tune it if the target is being
-# "lost" too easily, or if a bystander's hand is too easily accepted.
-MAX_TARGET_DISTANCE = 0.15
+# Person tracker settings.
+# YOLO detects people and ByteTrack maintains a temporary ID for each person.
+# Gesture recognition is accepted only when the detected hand belongs to the
+# locked target person's tracked ID.
+PERSON_MODEL_PATH = "yolo11n.pt"
+PERSON_TRACKER_CONFIG = "bytetrack.yaml"
+PERSON_CLASS_ID = 0
 
 os.makedirs(GESTURE_DATA_DIR, exist_ok=True)
 
@@ -59,6 +65,19 @@ if not cap.isOpened():
     print("Could not open camera")
     landmarker.close()
     exit()
+
+
+if YOLO is None:
+    print("Ultralytics is not installed.")
+    print("Install it with: pip install ultralytics")
+    landmarker.close()
+    cap.release()
+    exit()
+
+
+print("Loading person tracker...")
+person_tracker = YOLO(PERSON_MODEL_PATH)
+print("Person tracker loaded.")
 
 
 connections = [
@@ -219,6 +238,87 @@ def position_distance(p1, p2):
     ) ** 0.5
 
 
+def track_people(frame):
+    """Run person detection + ByteTrack and return tracked people."""
+    results = person_tracker.track(
+        frame,
+        persist=True,
+        classes=[PERSON_CLASS_ID],
+        tracker=PERSON_TRACKER_CONFIG,
+        verbose=False
+    )
+
+    people = []
+
+    if not results:
+        return people
+
+    boxes = results[0].boxes
+
+    if boxes is None or boxes.id is None:
+        return people
+
+    xyxy = boxes.xyxy.cpu().numpy()
+    ids = boxes.id.int().cpu().tolist()
+
+    for box, person_id in zip(xyxy, ids):
+        x1, y1, x2, y2 = box.tolist()
+        people.append({
+            "id": person_id,
+            "box": (x1, y1, x2, y2)
+        })
+
+    return people
+
+
+def hand_person_id(hand, people, frame_shape):
+    """Associate the detected hand with the person whose box contains its wrist."""
+    height, width = frame_shape[:2]
+    wrist_x = hand[0].x * width
+    wrist_y = hand[0].y * height
+
+    for person in people:
+        x1, y1, x2, y2 = person["box"]
+
+        if x1 <= wrist_x <= x2 and y1 <= wrist_y <= y2:
+            return person["id"]
+
+    return None
+
+
+def draw_people(frame, people, target_id=None):
+    """Draw tracked person boxes so target-ID behavior can be visually verified."""
+    for person in people:
+        x1, y1, x2, y2 = [int(v) for v in person["box"]]
+        person_id = person["id"]
+
+        thickness = 3 if person_id == target_id else 1
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            (255, 0, 255),
+            thickness
+        )
+
+        label = (
+            f"TARGET ID {person_id}"
+            if person_id == target_id
+            else f"Person {person_id}"
+        )
+
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            2
+        )
+
+
 def run_calibration():
 
     print()
@@ -237,6 +337,7 @@ def run_calibration():
             return False
 
         frame = cv2.flip(frame, 1)
+        track_people(frame)
 
         remaining = (
             RECALIBRATION_COUNTDOWN -
@@ -295,6 +396,7 @@ def run_calibration():
                 return False
 
             frame = cv2.flip(frame, 1)
+            track_people(frame)
 
             remaining = (
                 2 -
@@ -345,6 +447,7 @@ def run_calibration():
                 return False
 
             frame = cv2.flip(frame, 1)
+            track_people(frame)
 
             current_time = time.time()
 
@@ -514,6 +617,7 @@ print()
 # "ACTIVE": a target is paired and being tracked/gestured to.
 state = "IDLE"
 target_position = None
+target_person_id = None
 
 pairing_fist_start_time = None
 
@@ -532,6 +636,9 @@ while True:
         break
 
     frame = cv2.flip(frame, 1)
+
+    people = track_people(frame)
+    draw_people(frame, people, target_person_id)
 
     rgb = cv2.cvtColor(
         frame,
@@ -552,6 +659,7 @@ while True:
     confirmation_progress = 0.0
     pairing_progress = 0.0
     is_target = False
+    current_person_id = None
 
     if result.hand_landmarks:
 
@@ -561,6 +669,7 @@ while True:
 
         current_position = hand_position(hand)
         fist_detected = is_closed_fist(hand)
+        current_person_id = hand_person_id(hand, people, frame.shape)
 
         if state == "IDLE":
 
@@ -568,7 +677,7 @@ while True:
             gesture_start_time = None
             confirmed_gesture = None
 
-            if fist_detected:
+            if fist_detected and current_person_id is not None:
 
                 pairing_fist_start_time = (
                     pairing_fist_start_time
@@ -591,6 +700,7 @@ while True:
                     # target.
                     state = "ACTIVE"
                     target_position = current_position
+                    target_person_id = current_person_id
                     pairing_fist_start_time = None
 
                     print()
@@ -605,6 +715,7 @@ while True:
                     if not success:
                         state = "IDLE"
                         target_position = None
+                        target_person_id = None
                         candidate_gesture = None
                         gesture_start_time = None
                         confirmed_gesture = None
@@ -616,6 +727,7 @@ while True:
                     if model_data is None:
                         state = "IDLE"
                         target_position = None
+                        target_person_id = None
                         candidate_gesture = None
                         gesture_start_time = None
                         confirmed_gesture = None
@@ -638,9 +750,12 @@ while True:
 
         else:  # state == "ACTIVE"
 
+            # Target identity is now supplied by the person tracker.
+            # MAX_TARGET_DISTANCE remains defined above for compatibility,
+            # but it is no longer used to decide who may issue commands.
             is_target = (
-                position_distance(current_position, target_position)
-                <= MAX_TARGET_DISTANCE
+                current_person_id is not None and
+                current_person_id == target_person_id
             )
 
             if is_target:
@@ -693,6 +808,7 @@ while True:
 
                                         state = "IDLE"
                                         target_position = None
+                                        target_person_id = None
                                         candidate_gesture = None
                                         gesture_start_time = None
                                         confirmed_gesture = None
@@ -785,10 +901,11 @@ while True:
         if is_target:
 
             put_text(frame, "STATE: ACTIVE - target locked", 40, 0.8)
-            put_text(frame, f"Prediction: {prediction}", 75, 0.7)
-            put_text(frame, f"Confidence: {confidence:.2f}", 105, 0.6)
-            put_text(frame, f"Distance: {distance:.3f}", 135, 0.6)
-            put_text(frame, f"Threshold: {threshold:.3f}", 165, 0.6)
+            put_text(frame, f"Target ID: {target_person_id}", 70, 0.6)
+            put_text(frame, f"Prediction: {prediction}", 100, 0.7)
+            put_text(frame, f"Confidence: {confidence:.2f}", 130, 0.6)
+            put_text(frame, f"Distance: {distance:.3f}", 160, 0.6)
+            put_text(frame, f"Threshold: {threshold:.3f}", 190, 0.6)
 
             if candidate_gesture is not None:
 
@@ -800,11 +917,11 @@ while True:
                 put_text(
                     frame,
                     f"Confirming: {candidate_gesture}",
-                    200,
+                    220,
                     0.6
                 )
 
-                bar_x, bar_y, bar_width, bar_height = 20, 220, 400, 25
+                bar_x, bar_y, bar_width, bar_height = 20, 240, 400, 25
 
                 cv2.rectangle(
                     frame,
@@ -826,7 +943,7 @@ while True:
                 )
 
             if confirmed_gesture is not None:
-                put_text(frame, f"COMMAND: {confirmed_gesture}", 280, 0.75)
+                put_text(frame, f"COMMAND: {confirmed_gesture}", 300, 0.75)
 
         elif result.hand_landmarks:
 
@@ -842,7 +959,7 @@ while True:
         put_text(
             frame,
             "Target gestures DOCK to release",
-            320,
+            340,
             0.55
         )
 
