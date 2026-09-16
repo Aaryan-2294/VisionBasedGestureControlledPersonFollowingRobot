@@ -1,5 +1,6 @@
 import cv2
 import csv
+import json
 import time
 import os
 import joblib
@@ -44,6 +45,17 @@ PERSON_TRACKER_CONFIG = "bytetrack.yaml"
 PERSON_CLASS_ID = 0
 # Unix socket used to send confirmed gestures to the ROS 2 bridge.
 GESTURE_SOCKET_PATH = "/tmp/vbgc_gesture.sock"
+
+# Unix socket used to send the locked target position to the ROS 2 bridge.
+TARGET_SOCKET_PATH = "/tmp/vbgc_target.sock"
+TARGET_PUBLISH_INTERVAL = 0.10
+
+# Approximate monocular-camera distance model.
+# These values are configurable and should be tuned for the final camera.
+ASSUMED_PERSON_HEIGHT_METERS = 1.70
+CAMERA_FOCAL_LENGTH_PIXELS = 600.0
+MIN_TARGET_DISTANCE = 0.50
+MAX_TARGET_DISTANCE = 5.00
 
 os.makedirs(GESTURE_DATA_DIR, exist_ok=True)
 
@@ -351,6 +363,64 @@ def send_gesture_to_ros(gesture):
         )
         return False
 
+def send_target_to_ros(person_box, frame_shape):
+    """Estimate camera-relative target position and send it to the ROS 2 bridge."""
+    try:
+        x1, y1, x2, y2 = person_box
+        frame_height, frame_width = frame_shape[:2]
+
+        box_height = max(1.0, y2 - y1)
+        box_center_x = (x1 + x2) / 2.0
+
+        # Monocular distance estimate from apparent person height.
+        distance = (
+            ASSUMED_PERSON_HEIGHT_METERS * CAMERA_FOCAL_LENGTH_PIXELS
+        ) / box_height
+
+        distance = max(
+            MIN_TARGET_DISTANCE,
+            min(MAX_TARGET_DISTANCE, distance)
+        )
+
+        # Pixel offset from image center gives the target bearing.
+        # Positive ROS y is treated as left of the rover.
+        pixel_offset_x = box_center_x - (frame_width / 2.0)
+        angle = math.atan2(
+            -pixel_offset_x,
+            CAMERA_FOCAL_LENGTH_PIXELS
+        )
+
+        target_x = distance * math.cos(angle)
+        target_y = distance * math.sin(angle)
+
+        message = {
+            "x": target_x,
+            "y": target_y
+        }
+
+        with socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM
+        ) as target_socket:
+            target_socket.settimeout(0.2)
+            target_socket.connect(TARGET_SOCKET_PATH)
+            target_socket.sendall(
+                (json.dumps(message) + "\n").encode("utf-8")
+            )
+
+        return True
+
+    except (
+        FileNotFoundError,
+        ConnectionRefusedError,
+        TimeoutError,
+        BrokenPipeError,
+        ConnectionResetError,
+        OSError,
+    ):
+        return False
+
+
 def run_calibration():
 
     print()
@@ -657,6 +727,7 @@ candidate_gesture = None
 gesture_start_time = None
 confirmed_gesture = None
 rejection_start_time = None
+last_target_publish_time = 0.0
 
 
 while True:
@@ -791,6 +862,28 @@ while True:
             )
 
             if is_target:
+                target_box = next(
+                    (
+                        person["box"]
+                        for person in people
+                        if person["id"] == target_person_id
+                    ),
+                    None
+                )
+
+                current_time = time.time()
+
+                if (
+                    target_box is not None and
+                    current_time - last_target_publish_time
+                    >= TARGET_PUBLISH_INTERVAL
+                ):
+                    send_target_to_ros(
+                        target_box,
+                        frame.shape
+                    )
+                    last_target_publish_time = current_time
+
 
                 target_position = current_position
 

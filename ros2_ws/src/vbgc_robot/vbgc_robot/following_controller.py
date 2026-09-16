@@ -4,7 +4,6 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Pose, Twist
-from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
 
@@ -32,11 +31,6 @@ class FollowingController(Node):
         self.follow_enabled = False
         self.target_x = None
         self.target_y = None
-
-        self.rover_x = 0.0
-        self.rover_y = 0.0
-        self.rover_yaw = 0.0
-
         self.last_target_time = None
 
         # -----------------------------------------------------
@@ -63,13 +57,6 @@ class FollowingController(Node):
             10
         )
 
-        self.odom_subscription = self.create_subscription(
-            Odometry,
-            "/odom",
-            self.odom_callback,
-            10
-        )
-
         self.control_timer = self.create_timer(
             0.05,
             self.control_loop
@@ -78,7 +65,9 @@ class FollowingController(Node):
         self.get_logger().info(
             "Following controller started."
         )
-
+        self.get_logger().info(
+            "Target input: camera-relative /target_pose"
+        )
         self.get_logger().info(
             "Waiting for FOLLOW / STOP / DOCK..."
         )
@@ -92,70 +81,35 @@ class FollowingController(Node):
         command = msg.data.strip().upper()
 
         if command == "FOLLOW":
-
             self.follow_enabled = True
-
-            self.get_logger().info(
-                "FOLLOW enabled."
-            )
+            self.get_logger().info("FOLLOW enabled.")
 
         elif command == "STOP":
-
             self.follow_enabled = False
-
             self.publish_stop()
-
             self.get_logger().info(
                 "STOP received. Rover stopped."
             )
 
         elif command == "DOCK":
-
             self.follow_enabled = False
-
             self.publish_stop()
-
             self.get_logger().info(
                 "DOCK received. Rover stopped."
             )
 
     # =========================================================
-    # Target callback
+    # Camera target callback
     # =========================================================
 
     def target_callback(self, msg):
 
+        # /target_pose is camera-relative:
+        #   x = forward distance in metres
+        #   y = left/right displacement in metres
         self.target_x = msg.position.x
         self.target_y = msg.position.y
-
         self.last_target_time = self.get_clock().now()
-
-    # =========================================================
-    # Odometry callback
-    # =========================================================
-
-    def odom_callback(self, msg):
-
-        self.rover_x = msg.pose.pose.position.x
-        self.rover_y = msg.pose.pose.position.y
-
-        q = msg.pose.pose.orientation
-
-        # Quaternion -> yaw
-        sin_yaw = 2.0 * (
-            q.w * q.z +
-            q.x * q.y
-        )
-
-        cos_yaw = 1.0 - 2.0 * (
-            q.y * q.y +
-            q.z * q.z
-        )
-
-        self.rover_yaw = math.atan2(
-            sin_yaw,
-            cos_yaw
-        )
 
     # =========================================================
     # Main control loop
@@ -179,48 +133,32 @@ class FollowingController(Node):
             return
 
         target_age = (
-            self.get_clock().now() -
-            self.last_target_time
+            self.get_clock().now() - self.last_target_time
         ).nanoseconds / 1e9
 
         if target_age > self.target_timeout:
-
             self.publish_stop()
-
             self.get_logger().warn(
-                "Target lost. Rover stopped."
+                "Camera target lost. Rover stopped."
             )
-
             return
 
         # -----------------------------------------------------
-        # Position difference
+        # Camera-relative target position
         # -----------------------------------------------------
 
-        dx = self.target_x - self.rover_x
-        dy = self.target_y - self.rover_y
-
         distance = math.sqrt(
-            dx * dx +
-            dy * dy
+            self.target_x * self.target_x +
+            self.target_y * self.target_y
         )
 
         target_angle = math.atan2(
-            dy,
-            dx
+            self.target_y,
+            self.target_x
         )
-
-        angle_error = self.normalize_angle(
-            target_angle - self.rover_yaw
-        )
-
-        # -----------------------------------------------------
-        # Distance control
-        # -----------------------------------------------------
 
         distance_error = (
-            distance -
-            self.desired_distance
+            distance - self.desired_distance
         )
 
         twist = Twist()
@@ -229,7 +167,7 @@ class FollowingController(Node):
         # Turn toward target
         # -----------------------------------------------------
 
-        angular_speed = 1.5 * angle_error
+        angular_speed = 1.5 * target_angle
 
         angular_speed = max(
             -self.max_angular_speed,
@@ -246,7 +184,7 @@ class FollowingController(Node):
         # -----------------------------------------------------
 
         # Only move forward when reasonably aligned.
-        if abs(angle_error) < 0.6:
+        if abs(target_angle) < 0.6:
 
             if distance_error > self.distance_tolerance:
 
@@ -263,47 +201,28 @@ class FollowingController(Node):
                 twist.linear.x = linear_speed
 
             else:
-
                 twist.linear.x = 0.0
 
         else:
-
             twist.linear.x = 0.0
 
-        self.cmd_vel_publisher.publish(
-            twist
-        )
+        self.cmd_vel_publisher.publish(twist)
 
     # =========================================================
-    # Utility functions
+    # Utility
     # =========================================================
-
-    @staticmethod
-    def normalize_angle(angle):
-
-        while angle > math.pi:
-            angle -= 2.0 * math.pi
-
-        while angle < -math.pi:
-            angle += 2.0 * math.pi
-
-        return angle
 
     def publish_stop(self):
 
         stop = Twist()
-
         stop.linear.x = 0.0
         stop.linear.y = 0.0
         stop.linear.z = 0.0
-
         stop.angular.x = 0.0
         stop.angular.y = 0.0
         stop.angular.z = 0.0
 
-        self.cmd_vel_publisher.publish(
-            stop
-        )
+        self.cmd_vel_publisher.publish(stop)
 
 
 def main(args=None):
@@ -314,16 +233,11 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
-
     except KeyboardInterrupt:
         pass
-
     finally:
-
         node.publish_stop()
-
         node.destroy_node()
-
         rclpy.shutdown()
 
 
