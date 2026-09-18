@@ -121,12 +121,12 @@ def generate_launch_description():
     )
 
     # --------------------------------------------------------
-    # Simulated target
+    # Camera target publisher
     # --------------------------------------------------------
 
-    simulated_target = Node(
+    camera_target_publisher = Node(
         package="vbgc_robot",
-        executable="simulated_target",
+        executable="camera_target_publisher",
         output="screen"
     )
 
@@ -150,6 +150,6 @@ def generate_launch_description():
         spawn_robot,
         bridge,
         gesture_publisher,
-        simulated_target,
+        camera_target_publisher,
         following_controller
     ])
