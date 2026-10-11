@@ -3,7 +3,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import IncludeLaunchDescription, ExecuteProcess
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
@@ -12,13 +12,38 @@ import xacro
 
 def generate_launch_description():
 
+    # ========================================================
+    # PATHS
+    # ========================================================
+
     package_dir = get_package_share_directory(
         "vbgc_robot"
     )
 
-    # --------------------------------------------------------
-    # Robot description
-    # --------------------------------------------------------
+    # IMPORTANT:
+    # cc_ll.py uses relative paths for:
+    # yolo11n.pt
+    # hand_landmarker.task
+    # gesture_data/
+    # gesture_model.pkl
+    #
+    # Therefore its working directory MUST be the repository root.
+    repo_dir = os.path.expanduser(
+        "~/robot_vision/vbgcRobot"
+    )
+
+    vision_python = os.path.expanduser(
+        "~/robot_vision/.venv/bin/python3"
+    )
+
+    cc_ll_path = os.path.join(
+        repo_dir,
+        "cc_ll.py"
+    )
+
+    # ========================================================
+    # ROBOT DESCRIPTION
+    # ========================================================
 
     xacro_file = os.path.join(
         package_dir,
@@ -30,9 +55,9 @@ def generate_launch_description():
         xacro_file
     ).toxml()
 
-    # --------------------------------------------------------
-    # Gazebo
-    # --------------------------------------------------------
+    # ========================================================
+    # GAZEBO
+    # ========================================================
 
     ros_gz_sim_dir = get_package_share_directory(
         "ros_gz_sim"
@@ -59,9 +84,9 @@ def generate_launch_description():
         }.items()
     )
 
-    # --------------------------------------------------------
-    # Robot State Publisher
-    # --------------------------------------------------------
+    # ========================================================
+    # ROBOT STATE PUBLISHER
+    # ========================================================
 
     robot_state_publisher = Node(
         package="robot_state_publisher",
@@ -74,9 +99,9 @@ def generate_launch_description():
         ]
     )
 
-    # --------------------------------------------------------
-    # Spawn rover
-    # --------------------------------------------------------
+    # ========================================================
+    # SPAWN ROVER IN GAZEBO
+    # ========================================================
 
     spawn_robot = Node(
         package="ros_gz_sim",
@@ -96,9 +121,9 @@ def generate_launch_description():
         output="screen"
     )
 
-    # --------------------------------------------------------
-    # Gazebo <-> ROS 2 bridge
-    # --------------------------------------------------------
+    # ========================================================
+    # GAZEBO <-> ROS 2 BRIDGE
+    # ========================================================
 
     bridge = Node(
         package="ros_gz_bridge",
@@ -110,9 +135,9 @@ def generate_launch_description():
         output="screen"
     )
 
-    # --------------------------------------------------------
-    # Gesture publisher
-    # --------------------------------------------------------
+    # ========================================================
+    # GESTURE PUBLISHER
+    # ========================================================
 
     gesture_publisher = Node(
         package="vbgc_robot",
@@ -120,9 +145,9 @@ def generate_launch_description():
         output="screen"
     )
 
-    # --------------------------------------------------------
-    # Camera target publisher
-    # --------------------------------------------------------
+    # ========================================================
+    # CAMERA TARGET PUBLISHER
+    # ========================================================
 
     camera_target_publisher = Node(
         package="vbgc_robot",
@@ -130,9 +155,9 @@ def generate_launch_description():
         output="screen"
     )
 
-    # --------------------------------------------------------
-    # Following controller
-    # --------------------------------------------------------
+    # ========================================================
+    # FOLLOWING CONTROLLER
+    # ========================================================
 
     following_controller = Node(
         package="vbgc_robot",
@@ -140,16 +165,56 @@ def generate_launch_description():
         output="screen"
     )
 
-    # --------------------------------------------------------
-    # Start ROS 2 simulation system
-    # --------------------------------------------------------
+    # ========================================================
+    # ESP32 MOTOR BRIDGE
+    # ========================================================
+
+    esp32_motor_bridge = Node(
+        package="vbgc_robot",
+        executable="esp32_motor_bridge",
+        output="screen",
+        parameters=[
+            {
+                "serial_port": "/dev/ttyUSB0",
+                "baud_rate": 115200,
+                "command_timeout": 0.5
+            }
+        ]
+    )
+
+    # ========================================================
+    # CC_LL VISION + GESTURE CONTROLLER
+    # ========================================================
+
+    cc_ll = ExecuteProcess(
+        cmd=[
+            vision_python,
+            cc_ll_path
+        ],
+        cwd=repo_dir,
+        output="screen"
+    )
+
+    # ========================================================
+    # START EVERYTHING
+    # ========================================================
 
     return LaunchDescription([
+
+        # Gazebo
         gazebo,
         robot_state_publisher,
         spawn_robot,
         bridge,
+
+        # ROS control
         gesture_publisher,
         camera_target_publisher,
-        following_controller
+        following_controller,
+
+        # Physical rover
+        esp32_motor_bridge,
+
+        # Camera + person tracking + gesture recognition
+        cc_ll,
     ])

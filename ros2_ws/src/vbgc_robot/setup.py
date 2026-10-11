@@ -39,7 +39,7 @@ setup(
     zip_safe=True,
     maintainer='Aaryan Patel',
     maintainer_email='aaryanpatel2294@gmail.com',
-    description='TODO: Package description',
+    description='Vision guided person following rover',
     license='TODO: License declaration',
     extras_require={
         'test': [
@@ -48,10 +48,11 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        'gesture_publisher = vbgc_robot.gesture_publisher:main',
-        'camera_target_publisher = vbgc_robot.camera_target_publisher:main',
-        'simulated_target = vbgc_robot.simulated_target:main',
-        'following_controller = vbgc_robot.following_controller:main',
+            'gesture_publisher = vbgc_robot.gesture_publisher:main',
+            'camera_target_publisher = vbgc_robot.camera_target_publisher:main',
+            'simulated_target = vbgc_robot.simulated_target:main',
+            'following_controller = vbgc_robot.following_controller:main',
+            'esp32_motor_bridge = vbgc_robot.esp32_motor_bridge:main',
         ],
     },
 )

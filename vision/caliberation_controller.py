@@ -3,6 +3,7 @@ import csv
 import json
 import time
 import os
+import math
 import joblib
 import numpy as np
 import subprocess
@@ -74,7 +75,7 @@ options = vision.HandLandmarkerOptions(
 
 landmarker = vision.HandLandmarker.create_from_options(options)
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture("http://172.16.61.172:8080/video")
 
 if not cap.isOpened():
     print("Could not open camera")
